@@ -1,0 +1,9 @@
+# Deterministic scripted playback for recording
+idle
+wave twice
+walk forward for 3 seconds
+turn left
+walk forward for 2 seconds
+bow
+step back
+stop
