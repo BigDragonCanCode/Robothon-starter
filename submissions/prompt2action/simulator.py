@@ -206,121 +206,270 @@ class FFMasterDemoSession:
             "fall": False,
         }
 
+
     def _execute_physics_action(
-        self, action: ParsedAction, viewer: object | None, *, settle_after: bool
+        self,
+        action: ParsedAction,
+        viewer: object | None,
+        *,
+        settle_after: bool,
     ) -> dict[str, object]:
+        """Execute an action using torque-controlled MuJoCo physics."""
+
         assert self.physics is not None
-        duration_s = motion_duration(action.intent, action.duration_s,
-                                     action.turn_degrees, action.walk_distance_m)
+
+        duration_s = motion_duration(
+            action.intent,
+            action.duration_s,
+            action.turn_degrees,
+            action.walk_distance_m,
+        )
         repeats = max(1, action.repeat)
+
         initial = self.physics.state()
+
         requested_distance = action.walk_distance_m
         if requested_distance is None and action.intent in {"walk_forward", "step_back"}:
             requested_distance = 0.34 if action.intent == "walk_forward" else -0.18
+
         requested_yaw = 0.0
         if action.intent in {"turn_left", "turn_right"}:
             requested_yaw = math.radians(action.turn_degrees or 90.0)
             if action.intent == "turn_right":
                 requested_yaw *= -1.0
+
         fallen = False
         last_phase = "double_support"
         self.physics.peak_torque = 0.0
+
+        locomotion_intents = {"walk_forward", "step_back"}
+
         for _ in range(repeats):
             source_pose = capture_joint_pose(self.model, self.data)
+
             steps = max(1, round(duration_s / self.model.opt.timestep))
-            render_interval = max(1, round((1.0 / self.fps) / self.model.opt.timestep))
+            render_interval = max(
+                1,
+                round((1.0 / self.fps) / self.model.opt.timestep),
+            )
+
             for step_idx in range(steps):
                 elapsed_s = step_idx * self.model.opt.timestep
-                target = sample_motion_target(action.intent, elapsed_s, duration_s, source_pose)
+
+                target = sample_motion_target(
+                    action.intent,
+                    elapsed_s,
+                    duration_s,
+                    source_pose,
+                )
                 last_phase = target.gait_phase
+
+                # Keep upper-body gestures gentle in physics mode.
+                # Do NOT weaken walk/step leg and waist targets here:
+                # they are responsible for loading one foot while the other swings.
                 if action.intent in {"bow", "turn_left", "turn_right"}:
                     scale = 0.2 if action.intent == "bow" else 0.3
+
                     for name in target.joint_positions:
-                        if name.startswith(("left_hip", "right_hip", "left_knee", "right_knee",
-                                            "left_ankle", "right_ankle", "waist_")):
+                        if name.startswith(
+                            (
+                                "left_hip",
+                                "right_hip",
+                                "left_knee",
+                                "right_knee",
+                                "left_ankle",
+                                "right_ankle",
+                                "waist_",
+                            )
+                        ):
                             neutral = BASE_JOINT_POSE[name]
-                            target.joint_positions[name] = neutral + scale*(target.joint_positions[name]-neutral)
-                if action.intent in {"walk_forward", "step_back"}:
-                    target.joint_positions["waist_roll_joint"] = BASE_JOINT_POSE["waist_roll_joint"]
-                    target.joint_positions["waist_yaw_joint"] = BASE_JOINT_POSE["waist_yaw_joint"]
+                            target.joint_positions[name] = (
+                                neutral
+                                + scale
+                                * (target.joint_positions[name] - neutral)
+                            )
+
+                # Make walking targets stronger while keeping them alternating.
+                #
+                # sample_motion_target() already creates:
+                # - left/right alternating swing phases
+                # - knee lift
+                # - ankle compensation
+                # - waist roll for weight transfer
+                #
+                # We enlarge those offsets instead of moving both hips equally.
+                if action.intent in locomotion_intents:
+                    for name in (
+                        "left_hip_pitch_joint",
+                        "right_hip_pitch_joint",
+                        "left_knee_joint",
+                        "right_knee_joint",
+                        "left_ankle_pitch_joint",
+                        "right_ankle_pitch_joint",
+                        "left_hip_roll_joint",
+                        "right_hip_roll_joint",
+                        "left_ankle_roll_joint",
+                        "right_ankle_roll_joint",
+                        "waist_roll_joint",
+                    ):
+                        neutral = BASE_JOINT_POSE[name]
+                        target.joint_positions[name] = (
+                            neutral
+                            + 1.45
+                            * (target.joint_positions[name] - neutral)
+                        )
+
+                    # Small forward lean helps move the centre of mass ahead
+                    # of the stance foot without teleporting the free base.
+                    if action.intent == "walk_forward":
+                        target.joint_positions["waist_pitch_joint"] = (
+                            BASE_JOINT_POSE["waist_pitch_joint"] + 0.045
+                        )
+                    else:
+                        target.joint_positions["waist_pitch_joint"] = (
+                            BASE_JOINT_POSE["waist_pitch_joint"] - 0.020
+                        )
+
                 current = self.physics.state()
+
                 current_dx = current.base_x - initial.base_x
                 current_dy = current.base_y - initial.base_y
-                current_distance = current_dx*np.cos(initial.yaw) + current_dy*np.sin(initial.yaw)
-                forward_velocity = (
-                    self.data.qvel[0]*np.cos(initial.yaw)
-                    + self.data.qvel[1]*np.sin(initial.yaw)
+                current_distance = (
+                    current_dx * math.cos(initial.yaw)
+                    + current_dy * math.sin(initial.yaw)
                 )
-                current_yaw = wrapped_angle(current.yaw-initial.yaw)
-                if requested_distance is not None:
-                    remaining = requested_distance-current_distance
-                    if requested_distance >= 0.0:
-                        drive = min(0.05, max(0.0, 0.2*remaining))
-                        target.joint_positions["left_hip_pitch_joint"] += drive
-                        target.joint_positions["right_hip_pitch_joint"] += drive
-                    else:
-                        target.joint_positions["left_ankle_pitch_joint"] += 0.08
-                        target.joint_positions["right_ankle_pitch_joint"] += 0.08
+
+                forward_velocity = (
+                    self.data.qvel[0] * math.cos(initial.yaw)
+                    + self.data.qvel[1] * math.sin(initial.yaw)
+                )
+
+                current_yaw = wrapped_angle(current.yaw - initial.yaw)
+
+                # For turns, retain a small symmetric yaw request.
+                # This is separate from forward walking.
                 if requested_yaw != 0.0:
-                    remaining = wrapped_angle(requested_yaw-current_yaw)
-                    drive = -np.sign(remaining)*min(0.03, 0.01+0.05*abs(remaining))
-                    target.joint_positions["left_hip_yaw_joint"] += drive
-                    target.joint_positions["right_hip_yaw_joint"] += drive
+                    remaining_yaw = wrapped_angle(requested_yaw - current_yaw)
+                    yaw_drive = -np.sign(remaining_yaw) * min(
+                        0.03,
+                        0.01 + 0.05 * abs(remaining_yaw),
+                    )
+
+                    target.joint_positions["left_hip_yaw_joint"] += yaw_drive
+                    target.joint_positions["right_hip_yaw_joint"] += yaw_drive
+
                 self.physics.apply_targets(target.joint_positions)
                 mujoco.mj_step(self.model, self.data)
+
                 self.session_time_s += self.model.opt.timestep
                 self.state = self.physics.state()
+
                 if self.physics.fallen() or not np.isfinite(self.data.qpos).all():
                     fallen = True
                     self.has_fallen = True
                     self.physics.stop()
                     break
+
                 dx = self.state.base_x - initial.base_x
                 dy = self.state.base_y - initial.base_y
-                measured_distance = dx * np.cos(initial.yaw) + dy * np.sin(initial.yaw)
+
+                measured_distance = (
+                    dx * math.cos(initial.yaw)
+                    + dy * math.sin(initial.yaw)
+                )
                 measured_yaw = wrapped_angle(self.state.yaw - initial.yaw)
-                distance_reached = requested_distance is not None and (
-                    abs(measured_distance-requested_distance) < 0.025
+
+                distance_reached = (
+                    requested_distance is not None
+                    and abs(measured_distance - requested_distance) < 0.025
                     and abs(forward_velocity) < 0.12
                 )
-                yaw_reached = requested_yaw != 0.0 and (
-                    abs(wrapped_angle(measured_yaw-requested_yaw)) < math.radians(3)
+
+                yaw_reached = (
+                    requested_yaw != 0.0
+                    and abs(wrapped_angle(measured_yaw - requested_yaw))
+                    < math.radians(3.0)
                     and abs(self.data.qvel[5]) < 0.2
                 )
-                target_reached = distance_reached or yaw_reached
+
                 if step_idx % render_interval == 0:
-                    self._record_sample(action.intent, step_idx // render_interval)
+                    self._record_sample(
+                        action.intent,
+                        step_idx // render_interval,
+                    )
                     self._render_and_sync(viewer)
-                if target_reached:
+
+                if distance_reached or yaw_reached:
                     break
+
             if fallen:
                 break
+
         if fallen:
             self._rollout_fall(viewer)
         else:
             self.waiting_source_pose = capture_joint_pose(self.model, self.data)
             self.waiting_elapsed_s = 0.0
             self.waiting_balance_gain = 1.0
-        is_locomotion = action.intent in {"walk_forward", "step_back", "turn_left", "turn_right"}
+
+        is_locomotion = action.intent in {
+            "walk_forward",
+            "step_back",
+            "turn_left",
+            "turn_right",
+        }
+
         if settle_after and not fallen and not is_locomotion:
             self._physics_settle(viewer)
+
         self.state = self.physics.state()
+
         dx = self.state.base_x - initial.base_x
         dy = self.state.base_y - initial.base_y
-        measured_distance = float(dx*np.cos(initial.yaw) + dy*np.sin(initial.yaw))
+
+        measured_distance = float(
+            dx * math.cos(initial.yaw)
+            + dy * math.sin(initial.yaw)
+        )
         measured_yaw = wrapped_angle(self.state.yaw - initial.yaw)
-        requested = requested_distance if requested_distance is not None else requested_yaw if requested_yaw else None
-        measured = measured_distance if requested_distance is not None else measured_yaw if requested_yaw else None
+
+        requested = (
+            requested_distance
+            if requested_distance is not None
+            else requested_yaw
+            if requested_yaw
+            else None
+        )
+        measured = (
+            measured_distance
+            if requested_distance is not None
+            else measured_yaw
+            if requested_yaw
+            else None
+        )
+
         return {
-            "intent": action.intent, "control_mode": self.control_mode,
-            "duration_s": duration_s, "repeat": repeats,
-            "turn_degrees": action.turn_degrees, "walk_distance_m": action.walk_distance_m,
-            "requested_target": requested, "measured_displacement_m": round(measured_distance, 5),
+            "intent": action.intent,
+            "control_mode": self.control_mode,
+            "duration_s": duration_s,
+            "repeat": repeats,
+            "turn_degrees": action.turn_degrees,
+            "walk_distance_m": action.walk_distance_m,
+            "requested_target": requested,
+            "measured_displacement_m": round(measured_distance, 5),
             "measured_yaw_rad": round(measured_yaw, 5),
-            "target_error": round(float(requested-measured), 5) if requested is not None and measured is not None else None,
-            "fall": fallen, "contact_state": self.physics.contacts(), "gait_phase": last_phase,
+            "target_error": (
+                round(float(requested - measured), 5)
+                if requested is not None and measured is not None
+                else None
+            ),
+            "fall": fallen,
+            "contact_state": self.physics.contacts(),
+            "gait_phase": last_phase,
             "peak_actuator_torque": round(self.physics.peak_torque, 4),
         }
+
+
 
     def _physics_settle(self, viewer: object | None, duration_s: float = 0.6) -> None:
         assert self.physics is not None

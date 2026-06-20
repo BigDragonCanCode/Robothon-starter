@@ -298,24 +298,55 @@ def blend_joint_poses(source_pose: dict[str, float], target_pose: dict[str, floa
         blended[joint_name] = lerp(source, target, alpha)
     return blended
 
-
-def _apply_leg_gait(pose: dict[str, float], gait: float, stride_sign: float) -> None:
+def _apply_leg_gait(
+    pose: dict[str, float],
+    gait: float,
+    stride_sign: float,
+) -> None:
     left_phase = math.sin(gait)
     right_phase = math.sin(gait + math.pi)
+
     left_swing = max(0.0, left_phase)
     right_swing = max(0.0, right_phase)
+
     left_stance = max(0.0, -left_phase)
     right_stance = max(0.0, -right_phase)
 
-    pose["left_hip_pitch_joint"] += 0.08*stride_sign*left_stance - 0.22*stride_sign*left_swing
-    pose["left_knee_joint"] += 0.05*left_stance + 0.34*left_swing
-    pose["left_ankle_pitch_joint"] -= 0.04*stride_sign*left_stance - 0.16*stride_sign*left_swing
-    pose["left_ankle_roll_joint"] += 0.02*math.sin(gait + math.pi/2)
+    # Left leg
+    pose["left_hip_pitch_joint"] += (
+        0.08 * stride_sign * left_stance
+        - 0.22 * stride_sign * left_swing
+    )
 
-    pose["right_hip_pitch_joint"] += 0.08*stride_sign*right_stance - 0.22*stride_sign*right_swing
-    pose["right_knee_joint"] += 0.05*right_stance + 0.34*right_swing
-    pose["right_ankle_pitch_joint"] -= 0.04*stride_sign*right_stance - 0.16*stride_sign*right_swing
-    pose["right_ankle_roll_joint"] -= 0.02*math.sin(gait + math.pi/2)
+    # Higher knee clearance
+    pose["left_knee_joint"] += (
+        0.05 * left_stance
+        + 0.44 * left_swing
+    )
+
+    # Restore this exact ankle direction
+    pose["left_ankle_pitch_joint"] -= (
+        0.04 * stride_sign * left_stance
+        - 0.16 * stride_sign * left_swing
+    )
+
+    # Right leg
+    pose["right_hip_pitch_joint"] += (
+        0.08 * stride_sign * right_stance
+        - 0.22 * stride_sign * right_swing
+    )
+
+    # Higher knee clearance
+    pose["right_knee_joint"] += (
+        0.05 * right_stance
+        + 0.44 * right_swing
+    )
+
+    # Restore this exact ankle direction
+    pose["right_ankle_pitch_joint"] -= (
+        0.04 * stride_sign * right_stance
+        - 0.16 * stride_sign * right_swing
+    )
 
 
 def _apply_turn_step_gait(pose: dict[str, float], gait: float, turn_sign: float) -> None:
