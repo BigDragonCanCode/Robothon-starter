@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from .intents import ParsedCommand
+try:
+    from .intents import ParsedCommand
+except ImportError:
+    from intents import ParsedCommand
 
 
 def format_parsed_command(command: ParsedCommand) -> str:

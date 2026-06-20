@@ -6,7 +6,7 @@ Prompt2Action
 
 ## Robot platform
 
-FF Master humanoid using `assets/Master/scene.xml`
+FF Master humanoid using the bundled `assets/Master/scene.xml`
 
 ## Task goal
 
@@ -29,7 +29,8 @@ This is designed around the idea of FF robots being useful in education settings
 - One input can trigger multiple ordered actions
 - Fixed action vocabulary for reproducible judging and safer behavior
 - Optional `--batch-file` mode for scripted demo playback
-- Optional `--record-video` export to `outputs/prompt2action/`
+- Optional `--record-video` export to the local `outputs/` directory
+- Smoothed rear follow camera shared by the live viewer and video recorder
 - Stable JSON session summary with parsed action sequences and trajectory samples
 
 ## Educational value
@@ -53,6 +54,8 @@ Prompt2Action does not yet expose the underlying parsed action sequence in a ded
 
 ## Setup
 
+Run all commands below from inside `submissions/prompt2action/`.
+
 1. Install Python dependencies:
 
 ```bash
@@ -67,7 +70,7 @@ ollama pull llama3.2:3b
 ollama run llama3.2:3b "reply with json only"
 ```
 
-3. Confirm the model asset exists:
+3. Confirm the bundled model asset exists:
 
 ```bash
 ls assets/Master/scene.xml
@@ -78,29 +81,28 @@ ls assets/Master/scene.xml
 Interactive viewer mode:
 
 ```bash
-python3 submissions/prompt2action/run_language_demo.py
+python3 run_language_demo.py
 ```
 
-This defaults to actuator-driven MuJoCo physics. The pelvis remains free-floating and
-the controller uses motor torques, gravity, and foot contacts. To run the original
-scripted playback backend instead:
+This defaults to stable kinematic playback. To run the experimental actuator-driven
+physics backend instead:
 
 ```bash
-python3 submissions/prompt2action/run_language_demo.py --control-mode kinematic
+python3 run_language_demo.py --control-mode physics
 ```
 
 Interactive mode with deterministic fallback only:
 
 ```bash
-python3 submissions/prompt2action/run_language_demo.py --no-llm
+python3 run_language_demo.py --no-llm
 ```
 
 Batch playback with recording:
 
 ```bash
-python3 submissions/prompt2action/run_language_demo.py \
+python3 run_language_demo.py \
   --no-llm \
-  --batch-file submissions/prompt2action/demo_commands.txt \
+  --batch-file demo_commands.txt \
   --record-video
 ```
 
@@ -118,18 +120,13 @@ python3 submissions/prompt2action/run_language_demo.py \
 Create a deterministic artifact with:
 
 ```bash
-python3 submissions/prompt2action/run_language_demo.py \
-  --no-llm \
-  --batch-file submissions/prompt2action/demo_commands.txt \
-  --record-video \
-  --output-dir outputs/prompt2action
+python3 record_demo.py
 ```
 
 This writes:
 
-- `outputs/prompt2action/session.mp4` or a GIF fallback
-- `outputs/prompt2action/session_summary.json`
+- `demo_video/session.mp4` or a GIF fallback
+- `demo_video/session_summary.json`
 
-## Registration placeholder
-
-Update `registration.json` with the real Robothon UUID before submitting the pull request.
+The recorder streams frames directly to FFmpeg, so longer demos do not retain every
+raw frame in memory.

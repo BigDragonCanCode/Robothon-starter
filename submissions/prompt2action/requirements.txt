@@ -1,0 +1,3 @@
+mujoco
+numpy
+imageio[ffmpeg]

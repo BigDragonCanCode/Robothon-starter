@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import imageio.v2 as imageio_v2
 
 try:
     import imageio.v3 as iio
@@ -22,28 +23,86 @@ except ImportError as exc:
         f"Original error: {exc}"
     ) from exc
 
-from .intents import CommandTranslator, HELP_TEXT, ParsedAction, ParsedCommand
-from .monitor import format_diagnostic, format_parsed_command
-from .motions import (
-    BASE_JOINT_POSE,
-    MOTION_LIBRARY,
-    RobotState,
-    apply_motion_frame,
-    apply_neutral_pose,
-    capture_joint_pose,
-    list_motion_primitives,
-    motion_duration,
-    resolve_final_state,
-    sample_motion_target,
-)
-from .physics_controller import PhysicsController, wrapped_angle
+try:
+    from .intents import CommandTranslator, HELP_TEXT, ParsedAction, ParsedCommand
+    from .monitor import format_diagnostic, format_parsed_command
+    from .motions import (
+        BASE_JOINT_POSE,
+        MOTION_LIBRARY,
+        RobotState,
+        apply_motion_frame,
+        apply_neutral_pose,
+        capture_joint_pose,
+        list_motion_primitives,
+        motion_duration,
+        resolve_final_state,
+        sample_motion_target,
+    )
+    from .physics_controller import PhysicsController, wrapped_angle
+except ImportError:
+    from intents import CommandTranslator, HELP_TEXT, ParsedAction, ParsedCommand
+    from monitor import format_diagnostic, format_parsed_command
+    from motions import (
+        BASE_JOINT_POSE,
+        MOTION_LIBRARY,
+        RobotState,
+        apply_motion_frame,
+        apply_neutral_pose,
+        capture_joint_pose,
+        list_motion_primitives,
+        motion_duration,
+        resolve_final_state,
+        sample_motion_target,
+    )
+    from physics_controller import PhysicsController, wrapped_angle
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "assets" / "Master" / "scene.xml"
-DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "prompt2action"
+SUBMISSION_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL = SUBMISSION_DIR / "assets" / "Master" / "scene.xml"
+DEFAULT_OUTPUT_DIR = SUBMISSION_DIR / "outputs"
 DEFAULT_SUMMARY = "session_summary.json"
 DEFAULT_VIDEO = "session.mp4"
+
+
+class SmoothFollowCamera:
+    """Planar chase camera that ignores pelvis bob, pitch, and roll."""
+
+    def __init__(self, data: mujoco.MjData) -> None:
+        self.camera = mujoco.MjvCamera()
+        self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self.camera.distance = 2.35
+        self.camera.elevation = -10.0
+        self.x = float(data.qpos[0])
+        self.y = float(data.qpos[1])
+        self.yaw = self._yaw(data)
+        self.update(data, snap=True)
+
+    @staticmethod
+    def _yaw(data: mujoco.MjData) -> float:
+        w, x, y, z = (float(value) for value in data.qpos[3:7])
+        return math.atan2(2.0*(w*z+x*y), 1.0-2.0*(y*y+z*z))
+
+    def update(self, data: mujoco.MjData, *, snap: bool = False) -> None:
+        target_x = float(data.qpos[0])
+        target_y = float(data.qpos[1])
+        target_yaw = self._yaw(data)
+        alpha = 1.0 if snap else 0.12
+        self.x += alpha*(target_x-self.x)
+        self.y += alpha*(target_y-self.y)
+        self.yaw += alpha*wrapped_angle(target_yaw-self.yaw)
+        self.camera.lookat[:] = [
+            self.x+0.18*math.cos(self.yaw),
+            self.y+0.18*math.sin(self.yaw),
+            0.72,
+        ]
+        self.camera.azimuth = math.degrees(self.yaw)
+
+    def apply_to_viewer(self, viewer: object) -> None:
+        viewer.cam.type = self.camera.type
+        viewer.cam.lookat[:] = self.camera.lookat
+        viewer.cam.distance = self.camera.distance
+        viewer.cam.azimuth = self.camera.azimuth
+        viewer.cam.elevation = self.camera.elevation
 
 
 @dataclass(slots=True)
@@ -89,11 +148,18 @@ class FFMasterDemoSession:
         self.state = RobotState()
         self.session_time_s = 0.0
         self.frames: list[np.ndarray] = []
+        self.video_writer: object | None = None
         self.command_log: list[dict[str, object]] = []
         self.trajectory: list[dict[str, object]] = []
         self.has_fallen = False
         self.waiting_balance_gain = 1.0
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.record_video:
+            self.video_writer = imageio_v2.get_writer(
+                str(self.output_dir / DEFAULT_VIDEO),
+                fps=self.fps,
+                codec="libx264",
+            )
         self.physics = PhysicsController(self.model, self.data) if control_mode == "physics" else None
         if self.physics is not None:
             self.physics.initialize()
@@ -104,6 +170,7 @@ class FFMasterDemoSession:
             apply_neutral_pose(self.model, self.data, self.state)
             self.waiting_source_pose = None
             self.waiting_elapsed_s = 0.0
+        self.follow_camera = SmoothFollowCamera(self.data)
         self._record_sample("idle")
 
     def available_motions(self) -> dict[str, object]:
@@ -184,9 +251,10 @@ class FFMasterDemoSession:
                 )
                 self.session_time_s += 1.0 / self.fps
                 self._record_sample(action.intent, frame_idx)
+                self._update_follow_camera(viewer)
                 if self.renderer is not None:
-                    self.renderer.update_scene(self.data)
-                    self.frames.append(self.renderer.render().copy())
+                    self.renderer.update_scene(self.data, camera=self.follow_camera.camera)
+                    self._write_video_frame()
                 if viewer is not None:
                     try:
                         viewer.sync()
@@ -490,15 +558,29 @@ class FFMasterDemoSession:
                 self._render_and_sync(viewer)
 
     def _render_and_sync(self, viewer: object | None) -> None:
+        self._update_follow_camera(viewer)
         if self.renderer is not None:
-            self.renderer.update_scene(self.data)
-            self.frames.append(self.renderer.render().copy())
+            self.renderer.update_scene(self.data, camera=self.follow_camera.camera)
+            self._write_video_frame()
         if viewer is not None:
             try:
                 viewer.sync()
                 time.sleep(1.0/self.fps)
             except Exception:
                 pass
+
+    def _update_follow_camera(self, viewer: object | None) -> None:
+        self.follow_camera.update(self.data)
+        if viewer is not None:
+            self.follow_camera.apply_to_viewer(viewer)
+
+    def _write_video_frame(self) -> None:
+        assert self.renderer is not None
+        frame = self.renderer.render()
+        if self.video_writer is not None:
+            self.video_writer.append_data(frame)
+        else:
+            self.frames.append(frame.copy())
 
     def advance_waiting_physics(self, viewer: object | None, duration_s: float = 0.01) -> None:
         """Keep a passive viewer physically alive while waiting for terminal input."""
@@ -529,6 +611,7 @@ class FFMasterDemoSession:
                 self.physics.stop()
         if viewer is not None:
             try:
+                self._update_follow_camera(viewer)
                 viewer.sync()
             except Exception:
                 pass
@@ -564,9 +647,10 @@ class FFMasterDemoSession:
             )
             self.session_time_s += 1.0 / self.fps
             self._record_sample("idle", frame_idx)
+            self._update_follow_camera(viewer)
             if self.renderer is not None:
-                self.renderer.update_scene(self.data)
-                self.frames.append(self.renderer.render().copy())
+                self.renderer.update_scene(self.data, camera=self.follow_camera.camera)
+                self._write_video_frame()
             if viewer is not None:
                 try:
                     viewer.sync()
@@ -593,7 +677,10 @@ class FFMasterDemoSession:
             "supported_intents": sorted(MOTION_LIBRARY.keys()),
         }
 
-        if self.record_video and self.frames:
+        if self.video_writer is not None:
+            self.video_writer.close()
+            self.video_writer = None
+        elif self.record_video and self.frames:
             try:
                 iio.imwrite(video_path, np.asarray(self.frames), fps=self.fps, codec="libx264")
             except Exception as exc:
@@ -650,8 +737,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--headless", action="store_true", help="Disable the live MuJoCo viewer.")
-    parser.add_argument("--control-mode", choices=("physics", "kinematic"), default="physics",
-                        help="Use torque-controlled physics (default) or scripted kinematic playback.")
+    parser.add_argument("--control-mode", choices=("physics", "kinematic"), default="kinematic",
+                        help="Use scripted kinematic playback (default) or torque-controlled physics.")
     return parser.parse_args(argv)
 
 
@@ -684,6 +771,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with mujoco.viewer.launch_passive(session.model, session.data) as viewer:
+            session.follow_camera.update(session.data, snap=True)
+            session.follow_camera.apply_to_viewer(viewer)
             print(HELP_TEXT)
             print("Type a command, then press Enter. Type 'quit' to exit.")
             summary = run_interactive_session(session, translator, viewer)

@@ -6,7 +6,10 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-from .motions import BASE_JOINT_POSE, RobotState
+try:
+    from .motions import BASE_JOINT_POSE, RobotState
+except ImportError:
+    from motions import BASE_JOINT_POSE, RobotState
 
 
 @dataclass(frozen=True, slots=True)

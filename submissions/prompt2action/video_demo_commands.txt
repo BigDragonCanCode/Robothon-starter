@@ -1,0 +1,7 @@
+# Short deterministic showcase for the submission video
+wave
+walk forward for 1 meter
+turn left 90 degrees
+walk forward for 1 meter
+turn right 45 degrees
+bow
