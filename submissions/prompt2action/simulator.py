@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import select
 import sys
 import time
@@ -24,6 +25,7 @@ except ImportError as exc:
 from .intents import CommandTranslator, HELP_TEXT, ParsedAction, ParsedCommand
 from .monitor import format_diagnostic, format_parsed_command
 from .motions import (
+    BASE_JOINT_POSE,
     MOTION_LIBRARY,
     RobotState,
     apply_motion_frame,
@@ -32,7 +34,9 @@ from .motions import (
     list_motion_primitives,
     motion_duration,
     resolve_final_state,
+    sample_motion_target,
 )
+from .physics_controller import PhysicsController, wrapped_angle
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +72,7 @@ class FFMasterDemoSession:
         height: int,
         record_video: bool,
         output_dir: Path,
+        control_mode: str = "kinematic",
     ) -> None:
         self.model_path = model_path
         self.model = mujoco.MjModel.from_xml_path(str(model_path))
@@ -77,14 +82,28 @@ class FFMasterDemoSession:
         self.height = height
         self.output_dir = output_dir
         self.record_video = record_video
+        if control_mode not in {"physics", "kinematic"}:
+            raise ValueError(f"Unknown control mode: {control_mode}")
+        self.control_mode = control_mode
         self.renderer = mujoco.Renderer(self.model, width=width, height=height) if record_video else None
         self.state = RobotState()
         self.session_time_s = 0.0
         self.frames: list[np.ndarray] = []
         self.command_log: list[dict[str, object]] = []
         self.trajectory: list[dict[str, object]] = []
+        self.has_fallen = False
+        self.waiting_balance_gain = 1.0
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        apply_neutral_pose(self.model, self.data, self.state)
+        self.physics = PhysicsController(self.model, self.data) if control_mode == "physics" else None
+        if self.physics is not None:
+            self.physics.initialize()
+            self.state = self.physics.state()
+            self.waiting_source_pose = capture_joint_pose(self.model, self.data)
+            self.waiting_elapsed_s = 0.0
+        else:
+            apply_neutral_pose(self.model, self.data, self.state)
+            self.waiting_source_pose = None
+            self.waiting_elapsed_s = 0.0
         self._record_sample("idle")
 
     def available_motions(self) -> dict[str, object]:
@@ -97,7 +116,10 @@ class FFMasterDemoSession:
         action_summaries: list[dict[str, object]] = []
         for index, action in enumerate(command.actions):
             is_last_action = index == len(command.actions) - 1
-            action_summaries.append(self._execute_action(action, viewer, settle_after=is_last_action))
+            summary = self._execute_action(action, viewer, settle_after=is_last_action)
+            action_summaries.append(summary)
+            if summary.get("fall"):
+                break
 
         execution = CommandExecution(
             raw_text=command.raw_text,
@@ -109,6 +131,17 @@ class FFMasterDemoSession:
         return execution
 
     def _execute_action(
+        self,
+        action: ParsedAction,
+        viewer: object | None,
+        *,
+        settle_after: bool,
+    ) -> dict[str, object]:
+        if self.physics is not None:
+            return self._execute_physics_action(action, viewer, settle_after=settle_after)
+        return self._execute_kinematic_action(action, viewer, settle_after=settle_after)
+
+    def _execute_kinematic_action(
         self,
         action: ParsedAction,
         viewer: object | None,
@@ -165,11 +198,204 @@ class FFMasterDemoSession:
             self._settle_to_idle(viewer)
         return {
             "intent": action.intent,
+            "control_mode": self.control_mode,
             "duration_s": duration_s,
             "repeat": repeats,
             "turn_degrees": action.turn_degrees,
             "walk_distance_m": action.walk_distance_m,
+            "fall": False,
         }
+
+    def _execute_physics_action(
+        self, action: ParsedAction, viewer: object | None, *, settle_after: bool
+    ) -> dict[str, object]:
+        assert self.physics is not None
+        duration_s = motion_duration(action.intent, action.duration_s,
+                                     action.turn_degrees, action.walk_distance_m)
+        repeats = max(1, action.repeat)
+        initial = self.physics.state()
+        requested_distance = action.walk_distance_m
+        if requested_distance is None and action.intent in {"walk_forward", "step_back"}:
+            requested_distance = 0.34 if action.intent == "walk_forward" else -0.18
+        requested_yaw = 0.0
+        if action.intent in {"turn_left", "turn_right"}:
+            requested_yaw = math.radians(action.turn_degrees or 90.0)
+            if action.intent == "turn_right":
+                requested_yaw *= -1.0
+        fallen = False
+        last_phase = "double_support"
+        self.physics.peak_torque = 0.0
+        for _ in range(repeats):
+            source_pose = capture_joint_pose(self.model, self.data)
+            steps = max(1, round(duration_s / self.model.opt.timestep))
+            render_interval = max(1, round((1.0 / self.fps) / self.model.opt.timestep))
+            for step_idx in range(steps):
+                elapsed_s = step_idx * self.model.opt.timestep
+                target = sample_motion_target(action.intent, elapsed_s, duration_s, source_pose)
+                last_phase = target.gait_phase
+                if action.intent in {"bow", "turn_left", "turn_right"}:
+                    scale = 0.2 if action.intent == "bow" else 0.3
+                    for name in target.joint_positions:
+                        if name.startswith(("left_hip", "right_hip", "left_knee", "right_knee",
+                                            "left_ankle", "right_ankle", "waist_")):
+                            neutral = BASE_JOINT_POSE[name]
+                            target.joint_positions[name] = neutral + scale*(target.joint_positions[name]-neutral)
+                if action.intent in {"walk_forward", "step_back"}:
+                    target.joint_positions["waist_roll_joint"] = BASE_JOINT_POSE["waist_roll_joint"]
+                    target.joint_positions["waist_yaw_joint"] = BASE_JOINT_POSE["waist_yaw_joint"]
+                current = self.physics.state()
+                current_dx = current.base_x - initial.base_x
+                current_dy = current.base_y - initial.base_y
+                current_distance = current_dx*np.cos(initial.yaw) + current_dy*np.sin(initial.yaw)
+                forward_velocity = (
+                    self.data.qvel[0]*np.cos(initial.yaw)
+                    + self.data.qvel[1]*np.sin(initial.yaw)
+                )
+                current_yaw = wrapped_angle(current.yaw-initial.yaw)
+                if requested_distance is not None:
+                    remaining = requested_distance-current_distance
+                    if requested_distance >= 0.0:
+                        drive = min(0.05, max(0.0, 0.2*remaining))
+                        target.joint_positions["left_hip_pitch_joint"] += drive
+                        target.joint_positions["right_hip_pitch_joint"] += drive
+                    else:
+                        target.joint_positions["left_ankle_pitch_joint"] += 0.08
+                        target.joint_positions["right_ankle_pitch_joint"] += 0.08
+                if requested_yaw != 0.0:
+                    remaining = wrapped_angle(requested_yaw-current_yaw)
+                    drive = -np.sign(remaining)*min(0.03, 0.01+0.05*abs(remaining))
+                    target.joint_positions["left_hip_yaw_joint"] += drive
+                    target.joint_positions["right_hip_yaw_joint"] += drive
+                self.physics.apply_targets(target.joint_positions)
+                mujoco.mj_step(self.model, self.data)
+                self.session_time_s += self.model.opt.timestep
+                self.state = self.physics.state()
+                if self.physics.fallen() or not np.isfinite(self.data.qpos).all():
+                    fallen = True
+                    self.has_fallen = True
+                    self.physics.stop()
+                    break
+                dx = self.state.base_x - initial.base_x
+                dy = self.state.base_y - initial.base_y
+                measured_distance = dx * np.cos(initial.yaw) + dy * np.sin(initial.yaw)
+                measured_yaw = wrapped_angle(self.state.yaw - initial.yaw)
+                distance_reached = requested_distance is not None and (
+                    abs(measured_distance-requested_distance) < 0.025
+                    and abs(forward_velocity) < 0.12
+                )
+                yaw_reached = requested_yaw != 0.0 and (
+                    abs(wrapped_angle(measured_yaw-requested_yaw)) < math.radians(3)
+                    and abs(self.data.qvel[5]) < 0.2
+                )
+                target_reached = distance_reached or yaw_reached
+                if step_idx % render_interval == 0:
+                    self._record_sample(action.intent, step_idx // render_interval)
+                    self._render_and_sync(viewer)
+                if target_reached:
+                    break
+            if fallen:
+                break
+        if fallen:
+            self._rollout_fall(viewer)
+        else:
+            self.waiting_source_pose = capture_joint_pose(self.model, self.data)
+            self.waiting_elapsed_s = 0.0
+            self.waiting_balance_gain = 1.0
+        is_locomotion = action.intent in {"walk_forward", "step_back", "turn_left", "turn_right"}
+        if settle_after and not fallen and not is_locomotion:
+            self._physics_settle(viewer)
+        self.state = self.physics.state()
+        dx = self.state.base_x - initial.base_x
+        dy = self.state.base_y - initial.base_y
+        measured_distance = float(dx*np.cos(initial.yaw) + dy*np.sin(initial.yaw))
+        measured_yaw = wrapped_angle(self.state.yaw - initial.yaw)
+        requested = requested_distance if requested_distance is not None else requested_yaw if requested_yaw else None
+        measured = measured_distance if requested_distance is not None else measured_yaw if requested_yaw else None
+        return {
+            "intent": action.intent, "control_mode": self.control_mode,
+            "duration_s": duration_s, "repeat": repeats,
+            "turn_degrees": action.turn_degrees, "walk_distance_m": action.walk_distance_m,
+            "requested_target": requested, "measured_displacement_m": round(measured_distance, 5),
+            "measured_yaw_rad": round(measured_yaw, 5),
+            "target_error": round(float(requested-measured), 5) if requested is not None and measured is not None else None,
+            "fall": fallen, "contact_state": self.physics.contacts(), "gait_phase": last_phase,
+            "peak_actuator_torque": round(self.physics.peak_torque, 4),
+        }
+
+    def _physics_settle(self, viewer: object | None, duration_s: float = 0.6) -> None:
+        assert self.physics is not None
+        render_interval = max(1, round((1.0/self.fps) / self.model.opt.timestep))
+        for step_idx in range(max(1, round(duration_s/self.model.opt.timestep))):
+            self.physics.apply_targets(sample_motion_target("idle", step_idx*self.model.opt.timestep,
+                                                             duration_s).joint_positions)
+            mujoco.mj_step(self.model, self.data)
+            self.session_time_s += self.model.opt.timestep
+            self.state = self.physics.state()
+            if self.physics.fallen():
+                self.has_fallen = True
+                self.physics.stop()
+                self._rollout_fall(viewer)
+                break
+            if step_idx % render_interval == 0:
+                self._record_sample("idle", step_idx // render_interval)
+                self._render_and_sync(viewer)
+
+    def _render_and_sync(self, viewer: object | None) -> None:
+        if self.renderer is not None:
+            self.renderer.update_scene(self.data)
+            self.frames.append(self.renderer.render().copy())
+        if viewer is not None:
+            try:
+                viewer.sync()
+                time.sleep(1.0/self.fps)
+            except Exception:
+                pass
+
+    def advance_waiting_physics(self, viewer: object | None, duration_s: float = 0.01) -> None:
+        """Keep a passive viewer physically alive while waiting for terminal input."""
+        if self.physics is None:
+            return
+        steps = max(1, round(duration_s / self.model.opt.timestep))
+        for _ in range(steps):
+            if self.has_fallen:
+                self.physics.stop()
+            else:
+                target = sample_motion_target(
+                    "idle", self.waiting_elapsed_s, 1.2, self.waiting_source_pose
+                )
+                if self.waiting_balance_gain > 1.0:
+                    target.joint_positions = dict(BASE_JOINT_POSE)
+                    brake = float(np.clip(-0.05*self.data.qvel[0], -0.07, 0.03))
+                    target.joint_positions["left_hip_pitch_joint"] += brake
+                    target.joint_positions["right_hip_pitch_joint"] += brake
+                self.physics.apply_targets(
+                    target.joint_positions, balance_gain=self.waiting_balance_gain
+                )
+            mujoco.mj_step(self.model, self.data)
+            self.session_time_s += self.model.opt.timestep
+            self.waiting_elapsed_s += self.model.opt.timestep
+            self.state = self.physics.state()
+            if self.physics.fallen():
+                self.has_fallen = True
+                self.physics.stop()
+        if viewer is not None:
+            try:
+                viewer.sync()
+            except Exception:
+                pass
+
+    def _rollout_fall(self, viewer: object | None, duration_s: float = 1.5) -> None:
+        """Remove torque and let a failed robot finish falling under gravity."""
+        assert self.physics is not None
+        self.physics.stop()
+        render_interval = max(1, round((1.0 / self.fps) / self.model.opt.timestep))
+        for step_idx in range(max(1, round(duration_s / self.model.opt.timestep))):
+            mujoco.mj_step(self.model, self.data)
+            self.session_time_s += self.model.opt.timestep
+            self.state = self.physics.state()
+            if step_idx % render_interval == 0:
+                self._record_sample("fall", step_idx // render_interval)
+                self._render_and_sync(viewer)
 
     def _settle_to_idle(self, viewer: object | None) -> None:
         duration_s = 0.6
@@ -212,6 +438,7 @@ class FFMasterDemoSession:
             "video": str(video_path) if self.record_video else None,
             "summary_path": str(summary_path),
             "record_video": self.record_video,
+            "control_mode": self.control_mode,
             "final_pelvis_pos": final_pelvis,
             "session_time_s": round(self.session_time_s, 3),
             "supported_intents": sorted(MOTION_LIBRARY.keys()),
@@ -274,6 +501,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--headless", action="store_true", help="Disable the live MuJoCo viewer.")
+    parser.add_argument("--control-mode", choices=("physics", "kinematic"), default="physics",
+                        help="Use torque-controlled physics (default) or scripted kinematic playback.")
     return parser.parse_args(argv)
 
 
@@ -290,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         height=args.height,
         record_video=args.record_video,
         output_dir=args.output_dir,
+        control_mode=args.control_mode,
     )
 
     if args.batch_file is not None:
@@ -358,7 +588,7 @@ def run_interactive_session(
     viewer: object,
 ) -> dict[str, object]:
     while _viewer_running(viewer):
-        raw_command = _prompt_line("> ", viewer)
+        raw_command = _prompt_line("> ", viewer, session.advance_waiting_physics)
         if raw_command is None:
             break
         raw_command = raw_command.strip()
@@ -391,15 +621,21 @@ def _handle_command(
     session.execute(parsed, viewer=viewer)
 
 
-def _prompt_line(prompt: str, viewer: object) -> str | None:
+def _prompt_line(
+    prompt: str,
+    viewer: object,
+    on_wait: object | None = None,
+) -> str | None:
     print(prompt, end="", flush=True)
     while _viewer_running(viewer):
-        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+        ready, _, _ = select.select([sys.stdin], [], [], 0.01)
         if ready:
             line = sys.stdin.readline()
             if line == "":
                 return None
             return line.rstrip("\n")
+        if callable(on_wait):
+            on_wait(viewer, 0.01)
     return None
 
 

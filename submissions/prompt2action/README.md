@@ -81,6 +81,14 @@ Interactive viewer mode:
 python3 submissions/prompt2action/run_language_demo.py
 ```
 
+This defaults to actuator-driven MuJoCo physics. The pelvis remains free-floating and
+the controller uses motor torques, gravity, and foot contacts. To run the original
+scripted playback backend instead:
+
+```bash
+python3 submissions/prompt2action/run_language_demo.py --control-mode kinematic
+```
+
 Interactive mode with deterministic fallback only:
 
 ```bash
